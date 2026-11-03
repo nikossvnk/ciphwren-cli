@@ -24,7 +24,8 @@ for the synced collections/items).
 
 # Installation
 
-Python 3.10-3.13 is required (the etebase-py fork doesn't support Python 3.14 yet).
+Python 3.10-3.14 is required. (etebase-py 0.32+ builds against Python's stable ABI via PyO3, so
+Python 3.14 works; older versions of the fork crashed on it.)
 
 There's currently no installation process, just get the ```etesync-cli``` script from this repo,
 create a virtualenv and install the dependencies:
@@ -38,8 +39,11 @@ Building `etebase` from source requires a Rust toolchain ([rustup](https://rustu
 modules for the vendored OpenSSL build. On Fedora, if the OpenSSL build fails:
 
 ```
-dnf install perl-IPC-Cmd perl-ExtUtils-MakeMaker
+dnf install perl-IPC-Cmd perl-ExtUtils-MakeMaker perl-Time-Piece
 ```
+
+The package builds with [maturin](https://www.maturin.rs/) (PEP 517); ```pip``` fetches it
+automatically while building.
 
 # Usage
 
