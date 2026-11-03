@@ -9,13 +9,15 @@ Start a test server, then run from the repository root with the project virtuale
     podman run -d -p 127.0.0.1:3737:3735 test-server
     ETESYNC_TEST_API_URL=http://127.0.0.1:3737/ .venv/bin/python -m unittest -v tests.test_etesync_cli
 
-Without ETESYNC_TEST_API_URL (or when the server is unreachable) the suite skips itself.
+Without ETESYNC_TEST_API_URL (or when the server is unreachable) the suite skips itself; set
+ETESYNC_TEST_REQUIRE_SERVER=1 (e.g. in CI) to make that an error instead.
 
 Every test gets its own temporary HOME, so the real ~/.etesync-cli is never touched. The CLI is
 run through a subprocess with stdin piped and a detached session, so getpass() can't read from
 the developer's terminal.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -33,6 +35,7 @@ from etebase import Account, Client, User
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI_PATH = os.path.join(REPO_ROOT, "etesync-cli")
 SERVER_URL = os.environ.get("ETESYNC_TEST_API_URL")
+REQUIRE_SERVER = os.environ.get("ETESYNC_TEST_REQUIRE_SERVER") == "1"
 
 EVENT_MARKER = "Grocery shopping"
 CONTACT_MARKER = "Jane Doe"
@@ -152,11 +155,21 @@ def iter_files(root):
             yield os.path.join(dirpath, name)
 
 
+def new_account(server):
+    """Sign up a throwaway account; returns (username, service_password, account)."""
+    username = "cli" + uuid.uuid4().hex[:10]
+    service_password = "service-pass-" + uuid.uuid4().hex
+    account = Account.signup(Client("etesync-cli-test", server), User(username, "test@example.com"),
+                             service_password)
+    return username, service_password, account
+
+
 class EndToEndTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        skip = RuntimeError if REQUIRE_SERVER else unittest.SkipTest
         if not SERVER_URL:
-            raise unittest.SkipTest(
+            raise skip(
                 "ETESYNC_TEST_API_URL is not set; point it at a disposable test server "
                 "(see tests/test_etesync_cli.py docstring)")
         try:
@@ -164,15 +177,11 @@ class EndToEndTestCase(unittest.TestCase):
             with urllib.request.urlopen(probe, timeout=5):
                 pass
         except Exception as e:
-            raise unittest.SkipTest("test server not reachable at {}: {}".format(SERVER_URL, e))
+            raise skip("test server not reachable at {}: {}".format(SERVER_URL, e))
 
         cls.server = SERVER_URL
-        cls.username = "cli" + uuid.uuid4().hex[:10]
-        cls.service_password = "service-pass-" + uuid.uuid4().hex
-        cls.encryption_password = "enc-pass-" + uuid.uuid4().hex
-        client = Client("etesync-cli-test", cls.server)
-        account = Account.signup(client, User(cls.username, "test@example.com"),
-                                 cls.service_password)
+        cls.username, cls.service_password, account = new_account(cls.server)
+        cls.encryption_password = "local-pass-" + uuid.uuid4().hex
         cls.cal_uid, cls.ab_uid, cls.tasks_uid = seed(account)
 
     def setUp(self):
@@ -181,18 +190,24 @@ class EndToEndTestCase(unittest.TestCase):
         self.home = home
         self.cache_dir = os.path.join(home, ".etesync-cli")
 
-    def add_user(self, expect=0, extra_args=()):
-        return run_cli(["--server-url", self.server] + list(extra_args) +
-                       ["user", "add", self.username], self.home,
-                       stdin=self.service_password + "\n" + self.encryption_password + "\n",
+    def add_user(self, expect=0, username=None, service_password=None):
+        username = username or self.username
+        password = service_password or self.service_password
+        return run_cli(["user", "add", "--server-url", self.server, username], self.home,
+                       stdin="\n".join([password, self.encryption_password,
+                                        self.encryption_password, ""]),
                        expect=expect)
 
     def with_password(self, args, expect=0, password=None):
         return run_cli(args, self.home, stdin=(password or self.encryption_password) + "\n",
                        expect=expect)
 
-    def sync(self):
-        return self.with_password(["sync", self.username])
+    def sync(self, username=None):
+        return self.with_password(["sync", username or self.username])
+
+    def user_cache_dir(self, username=None):
+        key = (username or self.username).lower()
+        return os.path.join(self.cache_dir, "cache", hashlib.sha256(key.encode()).hexdigest())
 
     # --- user management ---------------------------------------------------------------
 
@@ -206,51 +221,99 @@ class EndToEndTestCase(unittest.TestCase):
             self.assertEqual(0o700, mode(self.cache_dir))
             self.assertEqual(0o600, mode(users_file))
 
-        # The stored material is ciphertext only.
+        # The stored material is ciphertext only; the server URL lives inside the session.
         with open(users_file, "rb") as f:
             blob = f.read()
         self.assertNotIn(self.service_password.encode(), blob)
         self.assertNotIn(self.encryption_password.encode(), blob)
-        self.assertIn(b'"salt"', blob)
-        self.assertIn(b'"session"', blob)
+        self.assertNotIn(self.server.encode(), blob)
+        entry = json.loads(blob)["users"][self.username]
+        self.assertEqual("scrypt", entry["kdf"]["name"])
 
-        # Adding the same user twice is refused.
-        proc = self.add_user(expect=1)
+        # Adding the same user twice is refused, whatever the case of the username.
+        proc = self.add_user(expect=1, username=self.username.upper())
         self.assertIn("User already exists", output(proc))
 
+    def test_add_user_rejects_bad_passphrases(self):
+        cases = [
+            ("short", "short", "at least 8 characters"),
+            (self.service_password, self.service_password, "must differ"),
+            ("local-pass-one", "local-pass-two", "don't match"),
+        ]
+        for passphrase, repeat, message in cases:
+            with self.subTest(message=message):
+                proc = run_cli(["user", "add", "--server-url", self.server, self.username],
+                               self.home, stdin="\n".join([self.service_password, passphrase,
+                                                           repeat, ""]), expect=1)
+                self.assertIn(message, output(proc))
+        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, "users_cache")))
+
     def test_add_user_rejects_unsafe_username(self):
-        for bad in ["../evil", ".hidden", "has/slash"]:
-            proc = run_cli(["--server-url", self.server, "user", "add", bad], self.home,
+        for bad in ["../evil", "has/slash", "has space"]:
+            proc = run_cli(["user", "add", "--server-url", self.server, bad], self.home,
                            expect=1)
             self.assertIn("Invalid username", output(proc))
+
+    def test_add_user_refuses_plain_http_to_remote_server(self):
+        proc = run_cli(["user", "add", "--server-url", "http://etebase.example.com/", "someone"],
+                       self.home, expect=1)
+        self.assertIn("unencrypted http://", output(proc))
 
     def test_unknown_user(self):
         proc = run_cli(["sync", "ghost"], self.home, expect=1)
         self.assertIn("User doesn't exist", output(proc))
 
-    def test_user_del_purges_cache(self):
+    def test_user_del_logs_out_and_purges_cache(self):
         self.add_user()
         self.sync()
-        self.assertTrue(os.path.isdir(os.path.join(self.cache_dir, "cache", self.username)))
+        self.assertTrue(os.path.isdir(self.user_cache_dir()))
+        users_file = os.path.join(self.cache_dir, "users_cache")
+        with open(users_file, "rb") as f:
+            saved_session = f.read()
 
-        run_cli(["user", "del", self.username], self.home)
-        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, "cache", self.username)))
+        proc = self.with_password(["user", "del", self.username])
+        self.assertIn("logged out", output(proc))
+        self.assertFalse(os.path.exists(self.user_cache_dir()))
         listing = output(run_cli(["user", "list"], self.home))
         self.assertNotIn(self.username, listing)
 
         proc = run_cli(["user", "del", self.username], self.home, expect=1)
         self.assertIn("User doesn't exist", output(proc))
 
-    def test_legacy_cache_migration(self):
-        os.makedirs(self.cache_dir, exist_ok=True)
-        legacy_file = os.path.join(self.cache_dir, "users_cache")
-        with open(legacy_file, "w", encoding="utf-8") as f:
-            json.dump({"users": {"olduser": "some-old-fernet-blob"}}, f)
+        # The deleted session's auth token no longer works on the server.
+        with open(users_file, "wb") as f:
+            f.write(saved_session)
+        proc = self.with_password(["sync", self.username], expect=1)
+        self.assertIn("Invalid token", output(proc))
 
-        proc = run_cli(["user", "list"], self.home)
-        self.assertIn("old format cache", output(proc))
-        self.assertTrue(os.path.exists(legacy_file + ".legacy"))
-        self.assertFalse(os.path.exists(legacy_file))
+    def test_user_del_local_only_needs_no_passphrase(self):
+        self.add_user()
+        proc = self.with_password(["user", "del", self.username], expect=1, password="wrong-one")
+        self.assertIn("--local-only", output(proc))
+        proc = run_cli(["user", "del", "--local-only", self.username], self.home)
+        self.assertIn("not logged out", output(proc))
+        self.assertNotIn(self.username, output(run_cli(["user", "list"], self.home)))
+
+    def test_legacy_caches_are_removed(self):
+        legacy_caches = [
+            {"users": {"olduser": "some-old-fernet-blob"}},  # etesync based version
+            {"version": 2, "salt": "c2FsdA==", "users": {"olduser": {"session": "x"}}},
+        ]
+        users_file = os.path.join(self.cache_dir, "users_cache")
+        old_cache = os.path.join(self.cache_dir, "cache", "olduser")
+        for legacy in legacy_caches:
+            with self.subTest(legacy=legacy):
+                os.makedirs(old_cache, exist_ok=True)
+                with open(users_file, "w", encoding="utf-8") as f:
+                    json.dump(legacy, f)
+                with open(users_file + ".legacy", "w", encoding="utf-8") as f:
+                    f.write("older backup")
+
+                proc = run_cli(["user", "list"], self.home)
+                self.assertIn("older etesync-cli version", output(proc))
+                self.assertNotIn("olduser", proc.stdout)
+                for path in [users_file, users_file + ".legacy", old_cache]:
+                    self.assertFalse(os.path.exists(path), path)
 
     # --- sync --------------------------------------------------------------------------
 
@@ -267,7 +330,7 @@ class EndToEndTestCase(unittest.TestCase):
             self.assertIn(name, listing)
 
         if os.name == "posix":
-            state_file = os.path.join(self.cache_dir, "cache", self.username, "state.json")
+            state_file = os.path.join(self.user_cache_dir(), "state.json")
             self.assertEqual(0o600, mode(state_file))
             self.assertEqual(0o700, mode(os.path.dirname(state_file)))
 
@@ -277,6 +340,7 @@ class EndToEndTestCase(unittest.TestCase):
                 blob = f.read()
             self.assertNotIn(EVENT_MARKER.encode(), blob, path)
             self.assertNotIn(CONTACT_MARKER.encode(), blob, path)
+            self.assertNotIn(EVENT1_UID.encode(), blob, path)
 
     def test_incremental_sync_is_a_noop(self):
         self.add_user()
@@ -284,7 +348,64 @@ class EndToEndTestCase(unittest.TestCase):
         self.assertIn("Collections updated: 3", output(first))
         second = self.sync()
         self.assertIn("Collections updated: 0, removed: 0", output(second))
-        self.assertIn("Items synced: 0", output(second))
+        self.assertIn("Items synced: 0, removed: 0", output(second))
+
+    def test_items_are_tracked_by_server_uid(self):
+        # Two items sharing a vObject UID, and an item whose name changes after the first sync:
+        # neither may lose or duplicate an item in the cache.
+        username, service_password, account = new_account(self.server)
+        col_mgr = account.get_collection_manager()
+        cal = col_mgr.create("etebase.vevent", {"name": "Clashes", "mtime": millis()}, b"")
+        col_mgr.upload(cal)
+        item_mgr = col_mgr.get_item_manager(cal)
+
+        def event(summary):
+            return EVENT_TEMPLATE.replace(EVENT_MARKER, summary).encode()
+
+        first = item_mgr.create({"name": "same@x", "mtime": millis()}, event("First twin"))
+        second = item_mgr.create({"name": "same@x", "mtime": millis()}, event("Second twin"))
+        renamed = item_mgr.create({"name": "old@x", "mtime": millis()}, event("Renamed one"))
+        item_mgr.batch([first, second, renamed], None, None)
+
+        self.add_user(username=username, service_password=service_password)
+        self.assertIn("Items synced: 3", output(self.sync(username)))
+        renamed.meta = {"name": "new@x", "mtime": millis()}
+        item_mgr.batch([renamed], None, None)
+        self.sync(username)
+        second.delete()
+        item_mgr.batch([second], None, None)
+        self.assertIn("Items synced: 0, removed: 1", output(self.sync(username)))
+
+        out = output(self.with_password(["list", username, cal.uid[:8]]))
+        self.assertIn("Collection items: 2", out)
+        self.assertEqual(1, out.count("First twin"))
+        self.assertEqual(1, out.count("Renamed one"))
+        self.assertNotIn("Second twin", out)
+
+    def test_output_strips_terminal_control_sequences(self):
+        username, service_password, account = new_account(self.server)
+        col_mgr = account.get_collection_manager()
+        evil = "Evil\x1b]0;title\x07\x1b[31m\u202eName"
+        cal = col_mgr.create("etebase.vevent", {"name": evil, "mtime": millis()}, b"")
+        col_mgr.upload(cal)
+        item_mgr = col_mgr.get_item_manager(cal)
+        content = EVENT_TEMPLATE.replace(EVENT_MARKER, "Party\x1b[2K\rtime").encode()
+        item = item_mgr.create({"name": "evil\x1b[1m@x", "mtime": millis()}, content)
+        item_mgr.batch([item], None, None)
+
+        self.add_user(username=username, service_password=service_password)
+        self.sync(username)
+        outputs = [
+            self.with_password(["list", username]),
+            self.with_password(["list", username, cal.uid[:8]]),
+            self.with_password(["journal", username, cal.uid[:8]]),
+        ]
+        for proc in outputs:
+            self.assertNotIn("\x1b", output(proc))
+            self.assertNotIn("\r", output(proc))
+            self.assertNotIn("\u202e", output(proc))
+        self.assertIn("Evil]0;title[31mName", output(outputs[0]))
+        self.assertIn("Party[2Ktime", output(outputs[1]))
 
     # --- listing -----------------------------------------------------------------------
 
@@ -296,15 +417,11 @@ class EndToEndTestCase(unittest.TestCase):
         self.assertIn("Collection items: 1", out)
         self.assertIn(EVENT_MARKER + " (updated)", out)
 
-    def test_list_prefix_requires_sync(self):
+    def test_list_requires_sync(self):
         self.add_user()
-        proc = self.with_password(["list", self.username, self.cal_uid[:8]], expect=1)
-        self.assertIn("run sync first", output(proc))
-
-        # The plain listing is live and needs no local cache.
-        listing = output(self.with_password(["list", self.username]))
-        self.assertIn("# Calendars", listing)
-        self.assertIn("Test Calendar", listing)
+        for args in [["list", self.username], ["list", self.username, self.cal_uid[:8]]]:
+            proc = self.with_password(args, expect=1)
+            self.assertIn("run sync first", output(proc))
 
     def test_list_unknown_prefix(self):
         self.add_user()
@@ -334,10 +451,10 @@ class EndToEndTestCase(unittest.TestCase):
 
     # --- authentication failures -------------------------------------------------------
 
-    def test_wrong_encryption_password(self):
+    def test_wrong_passphrase(self):
         self.add_user()
         proc = self.with_password(["sync", self.username], expect=1, password="wrong-password")
-        self.assertIn("Wrong encryption password", output(proc))
+        self.assertIn("Wrong passphrase", output(proc))
 
 
 if __name__ == "__main__":

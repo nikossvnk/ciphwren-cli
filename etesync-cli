@@ -2,14 +2,24 @@
 
 import argparse
 import base64
+import contextlib
 import datetime
 import getpass
 import hashlib
+import io
+import ipaddress
 import json
 import os
 import re
 import shutil
 import sys
+import tempfile
+import urllib.parse
+
+try:
+    import fcntl
+except ImportError:  # Not available on Windows: concurrent runs aren't serialized there.
+    fcntl = None
 
 import vobject
 
@@ -28,19 +38,36 @@ TYPE_HEADERS = {
 
 HOME_DIR = os.path.join(os.path.expanduser("~"), ".etesync-cli")
 USERS_FILE = os.path.join(HOME_DIR, "users_cache")
+LEGACY_USERS_FILE = USERS_FILE + ".legacy"
 CACHE_DIR = os.path.join(HOME_DIR, "cache")
+LOCK_FILE = os.path.join(HOME_DIR, "lock")
 
-USERS_VERSION = 2
-KDF_ITERATIONS = 600000
+USERS_VERSION = 3
+CACHE_VERSION = 2
+
+# The local passphrase is stretched with scrypt (memory hard, in the standard library).
+SCRYPT_N = 2 ** 15
+SCRYPT_R = 8
+SCRYPT_P = 1
+SCRYPT_MAXMEM = 64 * 1024 * 1024
 SALT_SIZE = 16
 KEY_SIZE = 32
+MIN_PASSPHRASE_LENGTH = 8
 
-# Usernames become path components, so they must look like email addresses and can't start with a
-# dot ("." and ".." would escape the directory). Collection UIDs are server generated and only
-# need to be path-safe. Item UIDs are content controlled (vObject UIDs) and never end up in paths,
-# they are hashed instead (see item_path).
-USERNAME_RE = re.compile(r"[A-Za-z0-9@+][A-Za-z0-9._+\-@]*\Z")
-COL_UID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+# Usernames follow the Etebase server's rules (Django's UnicodeUsernameValidator) and are
+# case-insensitive there, so they are lower-cased for local lookups. They never become path
+# components: per-user cache directories are named by a hash (see LocalCache).
+USERNAME_RE = re.compile(r"[\w.@+-]{1,150}\Z")
+# Collection and item UIDs are server generated (base64url) and used as file names.
+UID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+# Terminal control characters: C0 (except tab and newline), DEL, C1 and the bidi overrides.
+# Everything printed from the server (names, contents, errors) is untrusted, possibly written by
+# another user of a shared collection, and must not be able to drive the terminal.
+CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+
+
+def sanitize(text):
+    return CONTROL_RE.sub("", text.replace("\r\n", "\n"))
 
 
 def ensure_dir(path, mode=0o700):
@@ -48,24 +75,74 @@ def ensure_dir(path, mode=0o700):
     os.chmod(path, mode)
 
 
-def atomic_write(path, data, binary=False):
-    tmp_path = path + ".tmp"
-    if binary:
-        with open(tmp_path, "wb") as f:
+def fsync_dir(path):
+    if not hasattr(os, "O_DIRECTORY"):
+        return  # Windows can't open directories.
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path, data):
+    """Durably replace path with data (bytes); a crash leaves either the old or the new file."""
+    directory = os.path.dirname(path)
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
             f.write(data)
-    else:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(data)
-    os.replace(tmp_path, path)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp_path)
+        raise
+    fsync_dir(directory)
 
 
-def derive_key(password, salt):
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, KDF_ITERATIONS, dklen=KEY_SIZE)
+@contextlib.contextmanager
+def exclusive_lock():
+    """Serialize changes to ~/.etesync-cli so that concurrent runs can't lose updates."""
+    ensure_dir(HOME_DIR)
+    if fcntl is None:
+        yield
+        return
+    with open(LOCK_FILE, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
 
 
-def item_path(items_dir, item_uid):
-    digest = hashlib.sha256(item_uid.encode()).hexdigest()
-    return os.path.join(items_dir, digest)
+def derive_key(passphrase, salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P):
+    return hashlib.scrypt(passphrase.encode(), salt=salt, n=n, r=r, p=p, maxmem=SCRYPT_MAXMEM,
+                          dklen=KEY_SIZE)
+
+
+def user_key(username):
+    """Validate a username and return the key it is stored under locally."""
+    if not USERNAME_RE.fullmatch(username):
+        raise RuntimeError("Invalid username.")
+    return username.lower()
+
+
+def is_loopback(host):
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_server_url(url, allow_http=False):
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise RuntimeError("Invalid server URL '{}'.".format(url))
+    if parts.scheme == "http" and not allow_http and not is_loopback(parts.hostname):
+        raise RuntimeError("Refusing unencrypted http:// for a non-local server, it would expose "
+                           "your auth token. Use https:// or pass --allow-http.")
+    return url
 
 
 def format_mtime(mtime):
@@ -75,172 +152,209 @@ def format_mtime(mtime):
         return str(mtime)
 
 
-class UsersCache:
-    """Stores one encrypted Etebase session blob per user, plus the shared KDF salt.
+def mtime_sort_key(meta):
+    mtime = meta.get("mtime")
+    if isinstance(mtime, (int, float)) and not isinstance(mtime, bool):
+        return mtime
+    return 0
 
-    Each session blob is produced by Account.save() and is already encrypted at rest with a key
-    derived from the user's encryption password (PBKDF2-HMAC-SHA256, random salt), so this file
-    only ever holds ciphertext. The session blob also embeds the server URL and auth token, both
-    inside the encrypted payload.
+
+def remove_legacy_state():
+    """Delete session caches written by older versions of this tool.
+
+    They can't be used by this version (different library, KDF and file format), and keeping
+    them around only leaves credentials protected by weaker schemes on disk.
+    """
+    removed = False
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, ValueError):
+        data = None  # Missing, or corrupt (reported by UsersCache).
+    if isinstance(data, dict):
+        version = data.get("version")
+        if version is None or (isinstance(version, int) and version < USERS_VERSION):
+            os.remove(USERS_FILE)
+            shutil.rmtree(CACHE_DIR, ignore_errors=True)  # Older cache layouts.
+            removed = True
+    if os.path.exists(LEGACY_USERS_FILE):
+        os.remove(LEGACY_USERS_FILE)
+        removed = True
+    if removed:
+        print("Removed the session cache of an older etesync-cli version, please re-add your users.",
+              file=sys.stderr)
+
+
+class UsersCache:
+    """The users file: one encrypted Etebase session per user.
+
+    Usernames (lower-cased) are stored in the clear so that "user list" works without a
+    passphrase. Each session blob comes from Account.save(), encrypted with a key derived from the
+    user's local passphrase (scrypt, per-user random salt). The server URL and auth token are only
+    stored inside that encrypted blob.
     """
 
-    def __init__(self, filename=USERS_FILE):
-        self.filename = filename
-        self.salt = None
+    def __init__(self, filename=None):
+        self.filename = filename or USERS_FILE
         self.users = {}
         self._load()
 
     def _load(self):
-        if not os.path.exists(self.filename) or os.path.getsize(self.filename) == 0:
-            return
+        corrupt = 'Corrupt users cache at "{}". Remove it and re-add your users.'.format(self.filename)
         try:
             with open(self.filename, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except json.JSONDecodeError:
-            raise RuntimeError('Corrupt users cache at "{}". Remove it and re-add your users.'
+        except FileNotFoundError:
+            return
+        except (ValueError, UnicodeDecodeError):
+            raise RuntimeError(corrupt)
+        if not isinstance(data, dict) or not isinstance(data.get("users"), dict):
+            raise RuntimeError(corrupt)
+        if data.get("version") != USERS_VERSION:
+            raise RuntimeError('The users cache at "{}" was written by a newer etesync-cli version.'
                                .format(self.filename))
-        if not isinstance(data, dict) or not data.get("users"):
-            return
-        if "version" not in data:
-            # Pre-etebase cache: its sessions are incompatible with etebase, keep a backup copy.
-            backup = self.filename + ".legacy"
-            os.replace(self.filename, backup)
-            print('Found an old format cache, backed it up to "{}". Please re-add your users.'
-                  .format(backup), file=sys.stderr)
-            return
-        try:
-            self.salt = base64.b64decode(data["salt"])
-        except (KeyError, ValueError) as e:
-            raise RuntimeError('Corrupt users cache at "{}": {}. Remove it and re-add your users.'
-                               .format(self.filename, e))
         self.users = data["users"]
-
-    def ensure_salt(self):
-        if self.salt is None:
-            self.salt = os.urandom(SALT_SIZE)
-        return self.salt
 
     def save(self):
         ensure_dir(os.path.dirname(self.filename))
-        data = {
-            "version": USERS_VERSION,
-            "salt": base64.b64encode(self.ensure_salt()).decode(),
-            "users": self.users,
-        }
-        atomic_write(self.filename, json.dumps(data))
+        data = {"version": USERS_VERSION, "users": self.users}
+        atomic_write(self.filename, json.dumps(data).encode())
 
-    def get(self, username):
-        return self.users.get(username)
+    def get(self, key):
+        return self.users.get(key)
 
     def list(self):
         return sorted(self.users)
 
-    def set(self, username, entry):
-        self.users[username] = entry
+    def set(self, key, entry):
+        self.users[key] = entry
 
-    def delete(self, username):
-        return self.users.pop(username, None) is not None
+    def delete(self, key):
+        return self.users.pop(key, None) is not None
+
+
+def check_uid(uid):
+    if not UID_RE.fullmatch(uid):
+        raise RuntimeError("Invalid UID: {!r}".format(uid))
+    return uid
 
 
 class LocalCache:
-    """Local collection/item cache, one directory per user.
+    """Local collection/item cache, one directory per user (named by a hash of the username).
 
-    The blobs written here come from etebase's cache_save() and remain encrypted with the
-    account's keys, so the cache is not readable without the user's encryption password.
+    Files are named by server-generated UIDs. The blobs come from etebase's cache_save() and remain
+    encrypted with the account's keys, so the cache is not readable without the user's passphrase.
     """
 
-    def __init__(self, username):
-        if not USERNAME_RE.fullmatch(username):
-            raise RuntimeError("Invalid username.")
-        self.dir = os.path.join(CACHE_DIR, username)
+    def __init__(self, key):
+        self.dir = os.path.join(CACHE_DIR, hashlib.sha256(key.encode()).hexdigest())
         self.cols_dir = os.path.join(self.dir, "cols")
         self.state_file = os.path.join(self.dir, "state.json")
 
     def ensure(self):
+        ensure_dir(CACHE_DIR)
         ensure_dir(self.dir)
         ensure_dir(self.cols_dir)
         ensure_dir(os.path.join(self.dir, "items"))
 
+    def clear(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def has_synced(self):
+        return os.path.exists(self.state_file)
+
     def state(self):
         try:
             with open(self.state_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+                state = json.load(f)
         except FileNotFoundError:
-            pass
-        except json.JSONDecodeError:
+            state = None
+        except (ValueError, UnicodeDecodeError):
             raise RuntimeError('Corrupt cache state at "{}". Remove "{}" and run sync again.'
                                .format(self.state_file, self.dir))
-        return {"collections_stoken": None, "items": {}}
+        if not isinstance(state, dict) or state.get("version") != CACHE_VERSION:
+            self.clear()  # Unknown layout: start over with a full sync.
+            state = {"version": CACHE_VERSION, "collections_stoken": None, "items": {}}
+        return state
 
     def save_state(self, state):
         self.ensure()
-        atomic_write(self.state_file, json.dumps(state))
+        atomic_write(self.state_file, json.dumps(state).encode())
 
-    def col_path(self, uid):
-        if not COL_UID_RE.fullmatch(uid):
-            raise RuntimeError("Invalid collection UID: {!r}".format(uid))
-        return os.path.join(self.cols_dir, uid)
-
-    def items_dir(self, uid):
-        if not COL_UID_RE.fullmatch(uid):
-            raise RuntimeError("Invalid collection UID: {!r}".format(uid))
-        return os.path.join(self.dir, "items", uid)
+    def items_dir(self, col_uid):
+        return os.path.join(self.dir, "items", check_uid(col_uid))
 
     def save_collection(self, uid, blob):
         self.ensure()
-        atomic_write(self.col_path(uid), blob, binary=True)
+        atomic_write(os.path.join(self.cols_dir, check_uid(uid)), blob)
 
     def load_collection(self, uid):
-        with open(self.col_path(uid), "rb") as f:
+        with open(os.path.join(self.cols_dir, check_uid(uid)), "rb") as f:
             return f.read()
 
     def collection_uids(self):
         if not os.path.isdir(self.cols_dir):
             return []
-        return sorted(uid for uid in os.listdir(self.cols_dir) if COL_UID_RE.fullmatch(uid))
+        return sorted(uid for uid in os.listdir(self.cols_dir) if UID_RE.fullmatch(uid))
 
     def remove_collection(self, uid):
-        if not COL_UID_RE.fullmatch(uid):
+        if not UID_RE.fullmatch(uid):
             return
-        try:
-            os.remove(self.col_path(uid))
-        except FileNotFoundError:
-            pass
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(os.path.join(self.cols_dir, uid))
         shutil.rmtree(self.items_dir(uid), ignore_errors=True)
 
     def save_item(self, col_uid, item_uid, blob):
         items_dir = self.items_dir(col_uid)
         ensure_dir(items_dir)
-        atomic_write(item_path(items_dir, item_uid), blob, binary=True)
+        atomic_write(os.path.join(items_dir, check_uid(item_uid)), blob)
 
     def remove_item(self, col_uid, item_uid):
         try:
-            os.remove(item_path(self.items_dir(col_uid), item_uid))
+            os.remove(os.path.join(self.items_dir(col_uid), check_uid(item_uid)))
         except FileNotFoundError:
-            pass
+            return False
+        return True
 
     def item_paths(self, col_uid):
         items_dir = self.items_dir(col_uid)
         if not os.path.isdir(items_dir):
             return []
         return sorted(os.path.join(items_dir, name) for name in os.listdir(items_dir)
-                      if not name.endswith(".tmp"))
+                      if UID_RE.fullmatch(name))
+
+
+def new_session_entry(account, passphrase):
+    salt = os.urandom(SALT_SIZE)
+    return {
+        "session": account.save(derive_key(passphrase, salt)),
+        "salt": base64.b64encode(salt).decode(),
+        "kdf": {"name": "scrypt", "n": SCRYPT_N, "r": SCRYPT_R, "p": SCRYPT_P},
+    }
+
+
+def entry_key(entry, passphrase):
+    try:
+        kdf = entry["kdf"]
+        if kdf["name"] != "scrypt":
+            raise ValueError("unsupported KDF {!r}".format(kdf["name"]))
+        return derive_key(passphrase, base64.b64decode(entry["salt"]), kdf["n"], kdf["r"], kdf["p"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise RuntimeError("Corrupt session cache entry ({}), please re-add the user.".format(e))
 
 
 def get_account(username):
-    if not USERNAME_RE.fullmatch(username):
-        raise RuntimeError("Invalid username.")
-    users = UsersCache()
-    entry = users.get(username)
+    key = user_key(username)
+    entry = UsersCache().get(key)
     if entry is None:
         raise RuntimeError("User doesn't exist, please add it first.")
-    encryption_password = getpass.getpass(prompt="Please enter your encryption password: ")
-    key = derive_key(encryption_password, users.salt)
-    client = Client(APP_NAME, entry.get("serverUrl") or DEFAULT_SERVER_URL)
+    passphrase = getpass.getpass(prompt="Please enter your local passphrase: ")
+    # Account.restore() switches the client to the server URL stored inside the encrypted session.
+    client = Client(APP_NAME, DEFAULT_SERVER_URL)
     try:
-        return Account.restore(client, entry["session"], key)
+        return Account.restore(client, entry["session"], entry_key(entry, passphrase))
     except (EtebaseError, KeyError) as e:
-        raise RuntimeError("Wrong encryption password or corrupt session cache: {}".format(e))
+        raise RuntimeError("Wrong passphrase or corrupt session cache: {}".format(e))
 
 
 def list_collections(col_mgr, stoken=None):
@@ -277,11 +391,14 @@ def find_collection(col_mgr, prefix):
     return matches[0]
 
 
-def find_cached_collection(col_mgr, cache, prefix):
-    uids = cache.collection_uids()
-    if not uids:
+def require_synced(cache):
+    if not cache.has_synced():
         raise RuntimeError("No local cache found, please run sync first.")
-    matches = [uid for uid in uids if uid.startswith(prefix)]
+
+
+def find_cached_collection(col_mgr, cache, prefix):
+    require_synced(cache)
+    matches = [uid for uid in cache.collection_uids() if uid.startswith(prefix)]
     if not matches:
         raise RuntimeError("No collection matching '{}' found in the local cache, please run "
                            "sync first.".format(prefix))
@@ -309,11 +426,14 @@ def print_content(content):
     text = content.decode("utf-8", errors="replace")
     try:
         vobj = vobject.readOne(text)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            vobj.prettyPrint()
+        # Sanitize the rendered output: decoding (quoted-printable, base64) can produce controls.
+        text = buf.getvalue()
     except Exception:
-        # Untrusted content: never fail the whole listing on a malformed vObject.
-        print(text)
-        return
-    vobj.prettyPrint()
+        pass  # Untrusted content: print a malformed vObject raw instead of failing the listing.
+    print(sanitize(text).rstrip("\n"))
     print()
 
 
@@ -350,6 +470,7 @@ def sync_collections(account, cache):
 def sync_items(account, cache, state):
     col_mgr = account.get_collection_manager()
     pulled = 0
+    removed = 0
     for uid in cache.collection_uids():
         col = col_mgr.cache_load(cache.load_collection(uid))
         local_stoken = state["items"].get(uid, {}).get("local_stoken")
@@ -358,69 +479,95 @@ def sync_items(account, cache, state):
         item_mgr = col_mgr.get_item_manager(col)
         for item_list in list_items(item_mgr, local_stoken):
             for item in item_list.data:
-                meta = item.meta
-                if "name" not in meta:
-                    continue  # Skip malformed entries.
+                # Items are keyed by their server UID: the vObject UID in meta["name"] is chosen by
+                # clients, isn't unique and can change between revisions.
                 if item.deleted:
-                    cache.remove_item(uid, meta["name"])
+                    removed += cache.remove_item(uid, item.uid)
                 else:
-                    cache.save_item(uid, meta["name"], item_mgr.cache_save(item))
+                    cache.save_item(uid, item.uid, item_mgr.cache_save(item))
                     pulled += 1
             state["items"][uid] = {"local_stoken": item_list.stoken}
             cache.save_state(state)
-    return pulled
+    return pulled, removed
 
 
 def cmd_user_add(args):
-    if not USERNAME_RE.fullmatch(args.username):
-        raise RuntimeError("Invalid username.")
-    users = UsersCache()
-    if users.get(args.username) is not None:
+    key = user_key(args.username)
+    server_url = validate_server_url(
+        args.server_url or os.environ.get("ETESYNC_SERVER_URL") or DEFAULT_SERVER_URL,
+        args.allow_http)
+    if UsersCache().get(key) is not None:
         raise RuntimeError("User already exists. Delete first if you'd like to override settings.")
 
     service_password = getpass.getpass(prompt="Please enter the EteSync login password: ")
-    encryption_password = getpass.getpass(prompt="Please enter your encryption password: ")
-    if not encryption_password:
-        raise RuntimeError("Encryption password must not be empty.")
+    passphrase = getpass.getpass(
+        prompt="Choose a local passphrase to encrypt the stored session (not your EteSync password): ")
+    if len(passphrase) < MIN_PASSPHRASE_LENGTH:
+        raise RuntimeError("The local passphrase must be at least {} characters long."
+                           .format(MIN_PASSPHRASE_LENGTH))
+    if passphrase == service_password:
+        raise RuntimeError("The local passphrase must differ from your EteSync login password.")
+    if getpass.getpass(prompt="Repeat the local passphrase: ") != passphrase:
+        raise RuntimeError("The passphrases don't match.")
 
-    server_url = (args.server_url or os.environ.get("ETESYNC_SERVER_URL") or DEFAULT_SERVER_URL)
-    client = Client(APP_NAME, server_url)
-    account = Account.login(client, args.username, service_password)
-    session = account.save(derive_key(encryption_password, users.ensure_salt()))
-    users.set(args.username, {"session": session, "serverUrl": server_url})
-    users.save()
+    account = Account.login(Client(APP_NAME, server_url), args.username, service_password)
+    entry = new_session_entry(account, passphrase)
+    with exclusive_lock():
+        users = UsersCache()
+        if users.get(key) is not None:  # Added concurrently.
+            with contextlib.suppress(EtebaseError):
+                account.logout()
+            raise RuntimeError("User already exists. Delete first if you'd like to override settings.")
+        users.set(key, entry)
+        users.save()
     print("User added.")
 
 
 def cmd_user_del(args):
-    users = UsersCache()
-    if not users.delete(args.username):
+    key = user_key(args.username)
+    if UsersCache().get(key) is None:
         raise RuntimeError("User doesn't exist.")
-    users.save()
-    # Remove the user's local cache along with the session.
-    if USERNAME_RE.fullmatch(args.username):
-        shutil.rmtree(os.path.join(CACHE_DIR, args.username), ignore_errors=True)
-    print("User removed.")
+    if not args.local_only:
+        hint = " Use --local-only to remove the user without logging out."
+        try:
+            account = get_account(args.username)
+        except RuntimeError as e:
+            raise RuntimeError(str(e) + hint)
+        try:
+            account.logout()
+        except EtebaseError as e:
+            if "Invalid token" not in str(e):  # Already logged out is fine.
+                raise RuntimeError("Couldn't log out from the server: {}.{}".format(e, hint))
+    with exclusive_lock():
+        users = UsersCache()
+        users.delete(key)
+        users.save()
+        LocalCache(key).clear()
+    if args.local_only:
+        print("User removed (the session was not logged out on the server).")
+    else:
+        print("User logged out and removed.")
 
 
 def cmd_user_list(args):
     for username in UsersCache().list():
-        print(username)
+        print(sanitize(username))
 
 
 def cmd_sync(account, args):
-    cache = LocalCache(args.username)
-    cache.ensure()
-    state, seen, removed = sync_collections(account, cache)
-    pulled = sync_items(account, cache, state)
+    cache = LocalCache(user_key(args.username))
+    with exclusive_lock():
+        cache.ensure()
+        state, seen, removed = sync_collections(account, cache)
+        pulled, items_removed = sync_items(account, cache, state)
     print("Collections updated: {}, removed: {}".format(seen, removed))
-    print("Items synced: {}".format(pulled))
+    print("Items synced: {}, removed: {}".format(pulled, items_removed))
 
 
 def cmd_list(account, args):
     col_mgr = account.get_collection_manager()
+    cache = LocalCache(user_key(args.username))
     if args.journal is not None:
-        cache = LocalCache(args.username)
         col = find_cached_collection(col_mgr, cache, args.journal)
         item_paths = cache.item_paths(col.uid)
         print("Collection items: {}".format(len(item_paths)))
@@ -436,18 +583,19 @@ def cmd_list(account, args):
                 print_content(content)
         return
 
+    require_synced(cache)
     collections = {col_type: [] for col_type in COL_TYPES}
-    for col_list in list_collections(col_mgr):
-        for col in col_list.data:
-            if not col.deleted and col.collection_type in collections:
-                collections[col.collection_type].append(col)
+    for uid in cache.collection_uids():
+        col = col_mgr.cache_load(cache.load_collection(uid))
+        if col.collection_type in collections:
+            collections[col.collection_type].append((sanitize(col.meta.get("name") or "<unnamed>"), col))
 
     for index, col_type in enumerate(COL_TYPES):
         if index:
             print()
         print(TYPE_HEADERS[col_type])
-        for col in collections[col_type]:
-            print('\t{} ({})'.format(col.meta.get("name") or "<unnamed>", col.uid))
+        for name, col in sorted(collections[col_type], key=lambda entry: entry[0].casefold()):
+            print('\t{} ({})'.format(name, col.uid))
             if col.access_level == CollectionAccessLevel.ReadOnly:
                 print('\t\tRead only')
 
@@ -460,7 +608,8 @@ def cmd_journal(account, args):
     items = [item for page in list_items(item_mgr) for item in page.data]
     live_items = [item for item in items if not item.deleted]
 
-    revisions = []
+    # Etebase has no collection-wide history, so this takes one request per item.
+    entries = []
     for item in items:
         iterator = None
         item_revisions = []
@@ -470,27 +619,28 @@ def cmd_journal(account, args):
             iterator = revision_list.iterator
             if revision_list.done or not iterator:
                 break
-        revisions.append((item, item_revisions))
+        # The server returns newest first.
+        entries.extend((item, rev, rev.meta) for rev in reversed(item_revisions))
+    # Oldest first across the whole collection. mtime is client supplied and may be missing; the
+    # sort is stable, so such revisions keep their per-item order.
+    entries.sort(key=lambda entry: mtime_sort_key(entry[2]))
 
-    print("Journal items: {}".format(sum(len(revs) for _, revs in revisions)))
+    print("Journal items: {}".format(len(entries)))
     print("Collection items: {}".format(len(live_items)))
     print("\n# Items")
-    for item, item_revisions in revisions:
-        # Like the old journal view, show revisions oldest first.
-        for rev in reversed(item_revisions):
-            meta = rev.meta
-            flags = []
-            if meta.get("mtime") is not None:
-                flags.append("mtime: {}".format(format_mtime(meta["mtime"])))
-            if rev.deleted:
-                flags.append("deleted")
-            name = meta.get("name") or item.uid
-            print("{}{}".format(name, " ({})".format(", ".join(flags)) if flags else ""))
-            content = get_item_content(item_mgr, rev)
-            if content is None:
-                print("(content unavailable)\n")
-            else:
-                print_content(content)
+    for item, rev, meta in entries:
+        flags = []
+        if meta.get("mtime") is not None:
+            flags.append("mtime: {}".format(format_mtime(meta["mtime"])))
+        if rev.deleted:
+            flags.append("deleted")
+        name = str(meta.get("name") or item.uid)
+        print(sanitize("{}{}".format(name, " ({})".format(", ".join(flags)) if flags else "")))
+        content = get_item_content(item_mgr, rev)
+        if content is None:
+            print("(content unavailable)\n")
+        else:
+            print_content(content)
 
 
 def build_parser():
@@ -498,21 +648,21 @@ def build_parser():
         description="""A command line tool to access the change journal and contents of your \
 EteSync account.
 
-You will be prompted for your encryption password as needed.""")
-    parser.add_argument("--server-url", metavar="URL",
-                        help="Server to use when adding a user (default: {}, or the "
-                             "ETESYNC_SERVER_URL environment variable)".format(DEFAULT_SERVER_URL))
+You will be prompted for your local passphrase as needed.""")
     subparsers = parser.add_subparsers(help='available commands use "command -h" for help',
                                        dest='command')
     parser_sync = subparsers.add_parser('sync', help='Sync the local cache with the remote server')
     parser_sync.add_argument("username", help="The username used with EteSync")
 
-    parser_list = subparsers.add_parser('list', help='List collections (e.g. Calendars)')
+    parser_list = subparsers.add_parser(
+        'list', help='List the synced collections (e.g. Calendars), or the items of one of them')
     parser_list.add_argument("username", help="The username used with EteSync")
     parser_list.add_argument("journal", nargs='?',
                              help="The UID of the collection (or any prefix of it)")
 
-    parser_journal = subparsers.add_parser('journal', help='View the change journal')
+    parser_journal = subparsers.add_parser(
+        'journal', help='View the change journal (fetched live, one request per item: slow for '
+                        'large collections)')
     parser_journal.add_argument("username", help="The username used with EteSync")
     parser_journal.add_argument("journal", help="The UID of the collection (or any prefix of it)")
 
@@ -520,8 +670,16 @@ You will be prompted for your encryption password as needed.""")
     user_subparsers = parser_user.add_subparsers(help='sub-command -h for help', dest='sub_command')
     user_subparsers.add_parser('list', help='List all users')
     parser_user_add = user_subparsers.add_parser('add', help='Add a user')
+    parser_user_add.add_argument("--server-url", metavar="URL",
+                                 help="Server to use (default: the ETESYNC_SERVER_URL environment "
+                                      "variable, or {})".format(DEFAULT_SERVER_URL))
+    parser_user_add.add_argument("--allow-http", action="store_true",
+                                 help="Allow an unencrypted http:// URL for a non-local server")
     parser_user_add.add_argument("username", help="The username used with EteSync")
-    parser_user_del = user_subparsers.add_parser('del', help='Delete a user')
+    parser_user_del = user_subparsers.add_parser(
+        'del', help='Log out from the server and delete a user and its local cache')
+    parser_user_del.add_argument("--local-only", action="store_true",
+                                 help="Don't log out from the server (no passphrase needed)")
     parser_user_del.add_argument("username", help="The username used with EteSync")
     return parser
 
@@ -556,9 +714,11 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        with exclusive_lock():
+            remove_legacy_state()
         run(args)
     except (EtebaseError, RuntimeError) as e:
-        print("Error: {}".format(e), file=sys.stderr)
+        print("Error: {}".format(sanitize(str(e))), file=sys.stderr)
         return 1
     return 0
 
