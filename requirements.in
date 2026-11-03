@@ -1,2 +1,2 @@
-etebase @ git+https://github.com/nikossvnk/etebase-py@2530db58bfbaae25f5f691b784eb35aff584ec19
+etebase @ git+https://github.com/nikossvnk/etebase-py@v0.32.0
 vobject==0.9.9
