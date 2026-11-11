@@ -1,4 +1,14 @@
-A command line tool for accessing the EteSync journal and collections (e.g. Calendars)
+# Ciphwren CLI
+
+A command line tool for accessing the collections (e.g. Calendars) of a Ciphwren account, on any
+Etebase server, and their change journal.
+
+> [!NOTE]
+> **This is an independent fork** of [cli-client](https://github.com/etesync/cli-client), the
+> original project of the EteSync authors. This fork is not affiliated with, endorsed by or
+> supported by EteSync or Etebase in any way. The history of the original project is kept as it
+> is, with its authors, and the changes of this fork follow it. Like the original, it's licensed
+> under the [GPL-3.0](./LICENSE).
 
 # Intro
 
@@ -11,9 +21,9 @@ unmaintained `etesync` Python package.
 Security properties:
 
 * The cached session (auth token, keys and server URL) is encrypted at rest with a key derived
-  from a *local passphrase* you choose when adding the user (scrypt, random per-user salt). EteSync
-  2.0 has no separate encryption password, so this passphrase only protects the local copy; it
-  must differ from your EteSync password.
+  from a *local passphrase* you choose when adding the user (scrypt, random per-user salt). Etebase
+  has no separate encryption password, so this passphrase only protects the local copy; it
+  must differ from your login password.
 * The local item cache is encrypted too: it stores etebase's encrypted blobs, so it is not
   readable without your passphrase. (The old cache at ```~/.etesync/data.db``` was stored in
   plaintext.)
@@ -27,7 +37,7 @@ Security properties:
 * Plain ```http://``` server URLs are refused for non-local servers unless ```--allow-http``` is
   given.
 
-The cache lives at ```~/.etesync-cli/``` (```users_cache``` for the sessions and ```cache/```
+The cache lives at ```~/.ciphwren-cli/``` (```users_cache``` for the sessions and ```cache/```
 for the synced collections/items, one directory per user named by a hash of the username).
 
 # Installation
@@ -35,7 +45,7 @@ for the synced collections/items, one directory per user named by a hash of the 
 Python 3.10-3.14 is required. (etebase-py 0.32+ builds against Python's stable ABI via PyO3, so
 Python 3.14 works; older versions of the fork crashed on it.)
 
-There's currently no installation process, just get the ```etesync-cli``` script from this repo,
+There's currently no installation process, just get the ```ciphwren-cli``` script from this repo,
 create a virtualenv and install the dependencies:
 
 ```
@@ -57,15 +67,15 @@ automatically while building.
 
 Help:
 
-```etesync-cli -h```
+```ciphwren-cli -h```
 
-Add user. You'll be asked for your EteSync login password and to choose a local passphrase
-(at least 8 characters); use ```--server-url``` or the ```ETESYNC_SERVER_URL``` environment
-variable for a self-hosted server:
+Add user. You'll be asked for your login password and to choose a local passphrase (at least 8
+characters). There is no default server: give your server's URL with ```--server-url``` or the
+```CIPHWREN_SERVER_URL``` environment variable:
 
 ```
-etesync-cli user add me@etesync.com
-etesync-cli user add --server-url https://etebase.example.com/ me@example.com
+ciphwren-cli user add --server-url https://etebase.example.com/ me@example.com
+CIPHWREN_SERVER_URL=https://etebase.example.com/ ciphwren-cli user add me@example.com
 ```
 
 Viewing your data:
@@ -73,7 +83,7 @@ Viewing your data:
 Sync (sync is not automatic!)
 
 ```
-$ etesync-cli sync me@etesync.com
+$ ciphwren-cli sync me@example.com
 Collections updated: 3, removed: 0
 Items synced: 4, removed: 0
 ```
@@ -81,7 +91,7 @@ Items synced: 4, removed: 0
 View the list of synced collections (requires a sync first):
 
 ```
-$ etesync-cli list me@etesync.com
+$ ciphwren-cli list me@example.com
 # Address Books
         Default (0530a37fd91426293759cea8aa8d330f9945f323254236d1472e94aeef6a6e8f)
 
@@ -97,7 +107,7 @@ View the contents of a collection (requires a sync first; the argument is the co
 any prefix of it):
 
 ```
-$ etesync-cli list me@etesync.com 666d0561
+$ ciphwren-cli list me@example.com 666d0561
 Collection items: 1
 
 # Items
@@ -111,7 +121,7 @@ modification time). Etebase has no collection-wide history, so this makes one re
 and is slow for large collections:
 
 ```
-$ etesync-cli journal me@etesync.com 666d0561
+$ ciphwren-cli journal me@example.com 666d0561
 Journal items: 4
 Collection items: 1
 
@@ -125,12 +135,18 @@ Manage cached users (```user del``` asks for the passphrase to log the session o
 ```--local-only``` skips that, leaving the session valid on the server):
 
 ```
-$ etesync-cli user list
-$ etesync-cli user del me@etesync.com
-$ etesync-cli user del --local-only me@etesync.com
+$ ciphwren-cli user list
+$ ciphwren-cli user del me@example.com
+$ ciphwren-cli user del --local-only me@example.com
 ```
 
 # Upgrading from older versions
+
+This tool was called ```etesync-cli``` before. The first run of ```ciphwren-cli``` moves
+```~/.etesync-cli/``` to ```~/.ciphwren-cli/``` (unless that already exists), and the old
+```ETESYNC_SERVER_URL``` environment variable is still read. The old default server, EteSync's
+hosted service, was removed: users you already added keep the server they were added with, and
+new ones need ```--server-url``` or ```CIPHWREN_SERVER_URL```.
 
 Session caches written by older versions (the etesync-based one, and the first etebase-based
 one) are incompatible and are deleted on first use, together with their item cache and any
@@ -142,7 +158,7 @@ used (you can delete it). Re-add your users with ```user add``` and run ```sync`
 Style check:
 
 ```
-.venv/bin/python -m flake8 etesync-cli tests
+.venv/bin/python -m flake8 ciphwren-cli tests
 ```
 
 ## Testing
@@ -153,18 +169,19 @@ Offline tests of the local storage and the input/output hardening (no server nee
 .venv/bin/python -m unittest -v tests.test_unit
 ```
 
-The suite in ```tests/test_etesync_cli.py``` is end-to-end: it creates throwaway accounts on a
+The suite in ```tests/test_ciphwren_cli.py``` is end-to-end: it creates throwaway accounts on a
 real Etebase server and drives the CLI through a subprocess. There is deliberately no default
 server URL, so it can never create accounts on a personal server — you must point it at a
 *disposable* test server explicitly:
 
 ```
-podman run -d -p 127.0.0.1:3737:3735 test-server
-ETESYNC_TEST_API_URL=http://127.0.0.1:3737/ .venv/bin/python -m unittest -v tests.test_etesync_cli
+podman run -d -p 127.0.0.1:3737:3735 ghcr.io/nikossvnk/ciphwren-server/test-server
+CIPHWREN_TEST_API_URL=http://127.0.0.1:3737/ .venv/bin/python -m unittest -v tests.test_ciphwren_cli
 ```
 
-(The ```test-server``` image is built from the ```docker/test-server/Dockerfile``` in
-etesync-server; it allows signups.) Without ```ETESYNC_TEST_API_URL``` — or if the server is
-unreachable — the suite skips itself; set ```ETESYNC_TEST_REQUIRE_SERVER=1``` (e.g. in CI) to make
-that a failure instead. Every test gets a temporary ```HOME```, so your real ```~/.etesync-cli```
-is never touched.
+(The ```test-server``` image, ```ghcr.io/nikossvnk/ciphwren-server/test-server```, is built from
+the ```docker/test-server/Dockerfile``` in
+[ciphwren-server](https://github.com/nikossvnk/ciphwren-server); it allows signups.) Without
+```CIPHWREN_TEST_API_URL``` — or if the server is unreachable — the suite skips itself; set
+```CIPHWREN_TEST_REQUIRE_SERVER=1``` (e.g. in CI) to make that a failure instead. Every test gets a
+temporary ```HOME```, so your real ```~/.ciphwren-cli``` is never touched.

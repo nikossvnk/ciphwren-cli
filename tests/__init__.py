@@ -1,1 +1,1 @@
-"""Tests for etesync-cli."""
+"""Tests for ciphwren-cli."""
