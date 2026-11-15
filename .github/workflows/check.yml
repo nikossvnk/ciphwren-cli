@@ -1,0 +1,51 @@
+name: Check
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      # A disposable server: the end-to-end tests create throwaway accounts on it
+      server:
+        image: ghcr.io/nikossvnk/ciphwren-server/test-server:latest
+        ports:
+          - 127.0.0.1:3735:3735
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: pip install -r requirements.txt flake8
+
+      - name: Style check
+        run: python -m flake8 ciphwren-cli tests
+
+      - name: Unit tests
+        run: python -m unittest -v tests.test_unit
+
+      - name: End-to-end tests
+        env:
+          CIPHWREN_TEST_API_URL: http://127.0.0.1:3735/
+          CIPHWREN_TEST_REQUIRE_SERVER: "1"
+        run: |
+          timeout 60 sh -c 'until curl -sf -o /dev/null ${CIPHWREN_TEST_API_URL}api/v1/authentication/is_etebase/; do sleep 1; done'
+          python -m unittest -v tests.test_ciphwren_cli
