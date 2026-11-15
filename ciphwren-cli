@@ -26,8 +26,7 @@ import vobject
 from etebase import Account, Client, CollectionAccessLevel, FetchOptions
 from etebase.etebase_python import Error as EtebaseError
 
-APP_NAME = "etesync-cli"
-DEFAULT_SERVER_URL = "https://api.etebase.com/partner/etesync/"
+APP_NAME = "ciphwren-cli"
 COL_TYPES = ["etebase.vcard", "etebase.vevent", "etebase.vtodo"]
 
 TYPE_HEADERS = {
@@ -36,7 +35,9 @@ TYPE_HEADERS = {
     "etebase.vtodo": "# Tasks",
 }
 
-HOME_DIR = os.path.join(os.path.expanduser("~"), ".etesync-cli")
+HOME_DIR = os.path.join(os.path.expanduser("~"), ".ciphwren-cli")
+# Where the data was kept before the rename to Ciphwren. It is moved to HOME_DIR once.
+OLD_HOME_DIR = os.path.join(os.path.expanduser("~"), ".etesync-cli")
 USERS_FILE = os.path.join(HOME_DIR, "users_cache")
 LEGACY_USERS_FILE = USERS_FILE + ".legacy"
 CACHE_DIR = os.path.join(HOME_DIR, "cache")
@@ -64,6 +65,21 @@ UID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 # Everything printed from the server (names, contents, errors) is untrusted, possibly written by
 # another user of a shared collection, and must not be able to drive the terminal.
 CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+
+
+def env(name):
+    """The environment variable CIPHWREN_<name>, or ETESYNC_<name> as it was named before the rename."""
+    return os.environ.get("CIPHWREN_" + name, os.environ.get("ETESYNC_" + name))
+
+
+def move_old_home():
+    """Move ~/.etesync-cli, from a version before the rename, to HOME_DIR if that doesn't exist yet."""
+    if not os.path.isdir(OLD_HOME_DIR) or os.path.lexists(HOME_DIR):
+        return
+    try:
+        os.rename(OLD_HOME_DIR, HOME_DIR)
+    except FileNotFoundError:
+        pass  # Moved by a concurrent run.
 
 
 def sanitize(text):
@@ -104,7 +120,7 @@ def atomic_write(path, data):
 
 @contextlib.contextmanager
 def exclusive_lock():
-    """Serialize changes to ~/.etesync-cli so that concurrent runs can't lose updates."""
+    """Serialize changes to ~/.ciphwren-cli so that concurrent runs can't lose updates."""
     ensure_dir(HOME_DIR)
     if fcntl is None:
         yield
@@ -181,7 +197,7 @@ def remove_legacy_state():
         os.remove(LEGACY_USERS_FILE)
         removed = True
     if removed:
-        print("Removed the session cache of an older etesync-cli version, please re-add your users.",
+        print("Removed the session cache of an older ciphwren-cli version, please re-add your users.",
               file=sys.stderr)
 
 
@@ -211,7 +227,7 @@ class UsersCache:
         if not isinstance(data, dict) or not isinstance(data.get("users"), dict):
             raise RuntimeError(corrupt)
         if data.get("version") != USERS_VERSION:
-            raise RuntimeError('The users cache at "{}" was written by a newer etesync-cli version.'
+            raise RuntimeError('The users cache at "{}" was written by a newer ciphwren-cli version.'
                                .format(self.filename))
         self.users = data["users"]
 
@@ -349,8 +365,9 @@ def get_account(username):
     if entry is None:
         raise RuntimeError("User doesn't exist, please add it first.")
     passphrase = getpass.getpass(prompt="Please enter your local passphrase: ")
-    # Account.restore() switches the client to the server URL stored inside the encrypted session.
-    client = Client(APP_NAME, DEFAULT_SERVER_URL)
+    # Account.restore() switches the client to the server URL stored inside the encrypted session,
+    # so the URL given here is never contacted.
+    client = Client(APP_NAME, "http://localhost/")
     try:
         return Account.restore(client, entry["session"], entry_key(entry, passphrase))
     except (EtebaseError, KeyError) as e:
@@ -493,20 +510,22 @@ def sync_items(account, cache, state):
 
 def cmd_user_add(args):
     key = user_key(args.username)
-    server_url = validate_server_url(
-        args.server_url or os.environ.get("ETESYNC_SERVER_URL") or DEFAULT_SERVER_URL,
-        args.allow_http)
+    server_url = args.server_url or env("SERVER_URL")
+    if not server_url:
+        raise RuntimeError("Please give the URL of your server with --server-url or the "
+                           "CIPHWREN_SERVER_URL environment variable.")
+    server_url = validate_server_url(server_url, args.allow_http)
     if UsersCache().get(key) is not None:
         raise RuntimeError("User already exists. Delete first if you'd like to override settings.")
 
-    service_password = getpass.getpass(prompt="Please enter the EteSync login password: ")
+    service_password = getpass.getpass(prompt="Please enter the login password of the account: ")
     passphrase = getpass.getpass(
-        prompt="Choose a local passphrase to encrypt the stored session (not your EteSync password): ")
+        prompt="Choose a local passphrase to encrypt the stored session (not your login password): ")
     if len(passphrase) < MIN_PASSPHRASE_LENGTH:
         raise RuntimeError("The local passphrase must be at least {} characters long."
                            .format(MIN_PASSPHRASE_LENGTH))
     if passphrase == service_password:
-        raise RuntimeError("The local passphrase must differ from your EteSync login password.")
+        raise RuntimeError("The local passphrase must differ from your login password.")
     if getpass.getpass(prompt="Repeat the local passphrase: ") != passphrase:
         raise RuntimeError("The passphrases don't match.")
 
@@ -646,24 +665,24 @@ def cmd_journal(account, args):
 def build_parser():
     parser = argparse.ArgumentParser(
         description="""A command line tool to access the change journal and contents of your \
-EteSync account.
+Ciphwren account, on any Etebase server.
 
 You will be prompted for your local passphrase as needed.""")
     subparsers = parser.add_subparsers(help='available commands use "command -h" for help',
                                        dest='command')
     parser_sync = subparsers.add_parser('sync', help='Sync the local cache with the remote server')
-    parser_sync.add_argument("username", help="The username used with EteSync")
+    parser_sync.add_argument("username", help="The username of the account")
 
     parser_list = subparsers.add_parser(
         'list', help='List the synced collections (e.g. Calendars), or the items of one of them')
-    parser_list.add_argument("username", help="The username used with EteSync")
+    parser_list.add_argument("username", help="The username of the account")
     parser_list.add_argument("journal", nargs='?',
                              help="The UID of the collection (or any prefix of it)")
 
     parser_journal = subparsers.add_parser(
         'journal', help='View the change journal (fetched live, one request per item: slow for '
                         'large collections)')
-    parser_journal.add_argument("username", help="The username used with EteSync")
+    parser_journal.add_argument("username", help="The username of the account")
     parser_journal.add_argument("journal", help="The UID of the collection (or any prefix of it)")
 
     parser_user = subparsers.add_parser('user', help='Add, list and remove users from the client')
@@ -671,16 +690,16 @@ You will be prompted for your local passphrase as needed.""")
     user_subparsers.add_parser('list', help='List all users')
     parser_user_add = user_subparsers.add_parser('add', help='Add a user')
     parser_user_add.add_argument("--server-url", metavar="URL",
-                                 help="Server to use (default: the ETESYNC_SERVER_URL environment "
-                                      "variable, or {})".format(DEFAULT_SERVER_URL))
+                                 help="Server to use (default: the CIPHWREN_SERVER_URL environment "
+                                      "variable; one of the two is required)")
     parser_user_add.add_argument("--allow-http", action="store_true",
                                  help="Allow an unencrypted http:// URL for a non-local server")
-    parser_user_add.add_argument("username", help="The username used with EteSync")
+    parser_user_add.add_argument("username", help="The username of the account")
     parser_user_del = user_subparsers.add_parser(
         'del', help='Log out from the server and delete a user and its local cache')
     parser_user_del.add_argument("--local-only", action="store_true",
                                  help="Don't log out from the server (no passphrase needed)")
-    parser_user_del.add_argument("username", help="The username used with EteSync")
+    parser_user_del.add_argument("username", help="The username of the account")
     return parser
 
 
@@ -714,6 +733,7 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        move_old_home()
         with exclusive_lock():
             remove_legacy_state()
         run(args)

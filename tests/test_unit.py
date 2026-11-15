@@ -1,4 +1,4 @@
-"""Offline tests for etesync-cli's local storage and input/output hardening.
+"""Offline tests for ciphwren-cli's local storage and input/output hardening.
 
 The script has no .py extension, so it is loaded through SourceFileLoader. Each test points the
 module's paths at a temporary directory.
@@ -21,7 +21,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def load_cli():
-    loader = importlib.machinery.SourceFileLoader("etesync_cli", os.path.join(REPO_ROOT, "etesync-cli"))
+    loader = importlib.machinery.SourceFileLoader("ciphwren_cli", os.path.join(REPO_ROOT, "ciphwren-cli"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -33,11 +33,12 @@ cli = load_cli()
 
 class CliTestCase(unittest.TestCase):
     def setUp(self):
-        self.root = tempfile.mkdtemp(prefix="etesync-cli-unit-")
+        self.root = tempfile.mkdtemp(prefix="ciphwren-cli-unit-")
         self.addCleanup(shutil.rmtree, self.root, True)
-        home_dir = os.path.join(self.root, ".etesync-cli")
+        home_dir = os.path.join(self.root, ".ciphwren-cli")
         paths = {
             "HOME_DIR": home_dir,
+            "OLD_HOME_DIR": os.path.join(self.root, ".etesync-cli"),
             "USERS_FILE": os.path.join(home_dir, "users_cache"),
             "LEGACY_USERS_FILE": os.path.join(home_dir, "users_cache.legacy"),
             "CACHE_DIR": os.path.join(home_dir, "cache"),
@@ -107,7 +108,7 @@ class LegacyStateTest(CliTestCase):
                     f.write("backup")
                 with contextlib.redirect_stderr(io.StringIO()) as err:
                     cli.remove_legacy_state()
-                self.assertIn("older etesync-cli version", err.getvalue())
+                self.assertIn("older ciphwren-cli version", err.getvalue())
                 for path in [cli.USERS_FILE, cli.LEGACY_USERS_FILE, cli.CACHE_DIR]:
                     self.assertFalse(os.path.exists(path), path)
                 self.assertEqual({}, cli.UsersCache().users)
@@ -120,7 +121,7 @@ class LegacyStateTest(CliTestCase):
                     cli.remove_legacy_state()
                 self.assertEqual("", err.getvalue())
                 self.assertTrue(os.path.exists(cli.USERS_FILE))
-        with self.assertRaisesRegex(RuntimeError, "newer etesync-cli"):
+        with self.assertRaisesRegex(RuntimeError, "newer ciphwren-cli"):
             cli.UsersCache()
 
     def test_corrupt_users_file_is_reported_not_deleted(self):

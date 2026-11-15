@@ -1,18 +1,19 @@
-"""End-to-end tests for etesync-cli against a real Etebase server that allows signups
-(e.g. the etesync-server test-server image).
+"""End-to-end tests for ciphwren-cli against a real Etebase server that allows signups
+(e.g. the ciphwren-server test-server image).
 
-There is deliberately no default server URL: set ETESYNC_TEST_API_URL explicitly to a
+There is deliberately no default server URL: set CIPHWREN_TEST_API_URL explicitly to a
 *disposable* test server, so the suite can't accidentally create accounts on a personal one.
 
 Start a test server, then run from the repository root with the project virtualenv:
 
-    podman run -d -p 127.0.0.1:3737:3735 test-server
-    ETESYNC_TEST_API_URL=http://127.0.0.1:3737/ .venv/bin/python -m unittest -v tests.test_etesync_cli
+    podman run -d -p 127.0.0.1:3737:3735 ghcr.io/nikossvnk/ciphwren-server/test-server
+    CIPHWREN_TEST_API_URL=http://127.0.0.1:3737/ .venv/bin/python -m unittest -v tests.test_ciphwren_cli
 
-Without ETESYNC_TEST_API_URL (or when the server is unreachable) the suite skips itself; set
-ETESYNC_TEST_REQUIRE_SERVER=1 (e.g. in CI) to make that an error instead.
+Without CIPHWREN_TEST_API_URL (or when the server is unreachable) the suite skips itself; set
+CIPHWREN_TEST_REQUIRE_SERVER=1 (e.g. in CI) to make that an error instead. The ETESYNC_TEST_*
+names from before the rename still work.
 
-Every test gets its own temporary HOME, so the real ~/.etesync-cli is never touched. The CLI is
+Every test gets its own temporary HOME, so the real ~/.ciphwren-cli is never touched. The CLI is
 run through a subprocess with stdin piped and a detached session, so getpass() can't read from
 the developer's terminal.
 """
@@ -33,9 +34,11 @@ import uuid
 from etebase import Account, Client, User
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLI_PATH = os.path.join(REPO_ROOT, "etesync-cli")
-SERVER_URL = os.environ.get("ETESYNC_TEST_API_URL")
-REQUIRE_SERVER = os.environ.get("ETESYNC_TEST_REQUIRE_SERVER") == "1"
+CLI_PATH = os.path.join(REPO_ROOT, "ciphwren-cli")
+SERVER_URL = os.environ.get("CIPHWREN_TEST_API_URL", os.environ.get("ETESYNC_TEST_API_URL"))
+REQUIRE_SERVER = os.environ.get("CIPHWREN_TEST_REQUIRE_SERVER",
+                                os.environ.get("ETESYNC_TEST_REQUIRE_SERVER")) == "1"
+SERVER_URL_VARS = ["CIPHWREN_SERVER_URL", "ETESYNC_SERVER_URL"]
 
 EVENT_MARKER = "Grocery shopping"
 CONTACT_MARKER = "Jane Doe"
@@ -47,7 +50,7 @@ TASK_UID = "task-one@test.example.com"
 EVENT_TEMPLATE = "\n".join([
     "BEGIN:VCALENDAR",
     "VERSION:2.0",
-    "PRODID:-//etesync-cli test//EN",
+    "PRODID:-//ciphwren-cli test//EN",
     "BEGIN:VEVENT",
     "UID:event-one@test.example.com",
     "DTSTART:2026-11-05T10:00:00Z",
@@ -72,7 +75,7 @@ VCARD = "\n".join([
 VTODO = "\n".join([
     "BEGIN:VCALENDAR",
     "VERSION:2.0",
-    "PRODID:-//etesync-cli test//EN",
+    "PRODID:-//ciphwren-cli test//EN",
     "BEGIN:VTODO",
     "UID:task-one@test.example.com",
     "SUMMARY:Write report",
@@ -126,9 +129,10 @@ def seed(account):
     return cal.uid, ab.uid, tasks.uid
 
 
-def run_cli(args, home, stdin="", expect=0):
-    """Run etesync-cli in an isolated HOME; returns the completed process."""
-    env = dict(os.environ)
+def run_cli(args, home, stdin="", expect=0, extra_env=None):
+    """Run ciphwren-cli in an isolated HOME; returns the completed process."""
+    env = {k: v for k, v in os.environ.items() if k not in SERVER_URL_VARS}
+    env.update(extra_env or {})
     env["HOME"] = home
     env["PYTHONWARNINGS"] = "ignore"
     proc = subprocess.run([sys.executable, CLI_PATH] + list(args), input=stdin,
@@ -136,7 +140,7 @@ def run_cli(args, home, stdin="", expect=0):
                           start_new_session=True)
     if expect is not None and proc.returncode != expect:
         raise AssertionError(
-            "etesync-cli {} exited {} (expected {})\nstdout:\n{}\nstderr:\n{}".format(
+            "ciphwren-cli {} exited {} (expected {})\nstdout:\n{}\nstderr:\n{}".format(
                 " ".join(args), proc.returncode, expect, proc.stdout, proc.stderr))
     return proc
 
@@ -159,7 +163,7 @@ def new_account(server):
     """Sign up a throwaway account; returns (username, service_password, account)."""
     username = "cli" + uuid.uuid4().hex[:10]
     service_password = "service-pass-" + uuid.uuid4().hex
-    account = Account.signup(Client("etesync-cli-test", server), User(username, "test@example.com"),
+    account = Account.signup(Client("ciphwren-cli-test", server), User(username, "test@example.com"),
                              service_password)
     return username, service_password, account
 
@@ -170,8 +174,8 @@ class EndToEndTestCase(unittest.TestCase):
         skip = RuntimeError if REQUIRE_SERVER else unittest.SkipTest
         if not SERVER_URL:
             raise skip(
-                "ETESYNC_TEST_API_URL is not set; point it at a disposable test server "
-                "(see tests/test_etesync_cli.py docstring)")
+                "CIPHWREN_TEST_API_URL is not set; point it at a disposable test server "
+                "(see tests/test_ciphwren_cli.py docstring)")
         try:
             probe = SERVER_URL.rstrip("/") + "/api/v1/authentication/is_etebase/"
             with urllib.request.urlopen(probe, timeout=5):
@@ -185,10 +189,10 @@ class EndToEndTestCase(unittest.TestCase):
         cls.cal_uid, cls.ab_uid, cls.tasks_uid = seed(account)
 
     def setUp(self):
-        home = tempfile.mkdtemp(prefix="etesync-cli-test-")
+        home = tempfile.mkdtemp(prefix="ciphwren-cli-test-")
         self.addCleanup(shutil.rmtree, home, True)
         self.home = home
-        self.cache_dir = os.path.join(home, ".etesync-cli")
+        self.cache_dir = os.path.join(home, ".ciphwren-cli")
 
     def add_user(self, expect=0, username=None, service_password=None):
         username = username or self.username
@@ -259,6 +263,46 @@ class EndToEndTestCase(unittest.TestCase):
                        self.home, expect=1)
         self.assertIn("unencrypted http://", output(proc))
 
+    def test_add_user_needs_a_server_url(self):
+        proc = run_cli(["user", "add", self.username], self.home, expect=1)
+        self.assertIn("--server-url or the CIPHWREN_SERVER_URL", output(proc))
+        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, "users_cache")))
+
+    def test_server_url_from_environment(self):
+        # CIPHWREN_SERVER_URL, and ETESYNC_SERVER_URL as it was named before the rename.
+        for var in SERVER_URL_VARS:
+            with self.subTest(var=var):
+                run_cli(["user", "add", self.username], self.home,
+                        stdin="\n".join([self.service_password, self.encryption_password,
+                                         self.encryption_password, ""]),
+                        extra_env={var: self.server})
+                self.assertIn("Collections updated: 3", output(self.sync()))
+                listing = output(self.with_password(["list", self.username, self.tasks_uid]))
+                self.assertIn("Write report", listing)
+                run_cli(["user", "del", "--local-only", self.username], self.home)
+
+    def test_data_of_old_name_is_moved(self):
+        self.add_user()
+        self.sync()
+        old_dir = os.path.join(self.home, ".etesync-cli")
+        os.rename(self.cache_dir, old_dir)
+
+        self.assertIn(self.username, output(run_cli(["user", "list"], self.home)))
+        self.assertFalse(os.path.exists(old_dir))
+        # The moved session and item cache still work, without a new sync.
+        listing = output(self.with_password(["list", self.username, self.cal_uid]))
+        self.assertIn(EVENT_MARKER + " (updated)", listing)
+
+    def test_data_of_old_name_is_left_when_new_exists(self):
+        self.add_user()
+        old_dir = os.path.join(self.home, ".etesync-cli")
+        os.makedirs(old_dir)
+        with open(os.path.join(old_dir, "users_cache"), "w", encoding="utf-8") as f:
+            f.write("old")
+        self.assertIn(self.username, output(run_cli(["user", "list"], self.home)))
+        with open(os.path.join(old_dir, "users_cache"), encoding="utf-8") as f:
+            self.assertEqual("old", f.read())
+
     def test_unknown_user(self):
         proc = run_cli(["sync", "ghost"], self.home, expect=1)
         self.assertIn("User doesn't exist", output(proc))
@@ -310,7 +354,7 @@ class EndToEndTestCase(unittest.TestCase):
                     f.write("older backup")
 
                 proc = run_cli(["user", "list"], self.home)
-                self.assertIn("older etesync-cli version", output(proc))
+                self.assertIn("older ciphwren-cli version", output(proc))
                 self.assertNotIn("olduser", proc.stdout)
                 for path in [users_file, users_file + ".legacy", old_cache]:
                     self.assertFalse(os.path.exists(path), path)
