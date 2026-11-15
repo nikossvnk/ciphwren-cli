@@ -15,8 +15,8 @@ Etebase server, and their change journal.
 This will at some point become a fully fledge tool, though at the moment it's quite raw.
 
 The client has been rewritten on top of the Etebase API using the maintained
-[`etebase-py`](https://github.com/nikossvnk/etebase-py) fork, which replaces the old and
-unmaintained `etesync` Python package.
+[`etebase-py`](https://github.com/nikossvnk/etebase-py) fork (the `ciphwren-etebase` package, imported as
+`etebase`), which replaces the old and unmaintained `etesync` Python package.
 
 Security properties:
 
@@ -42,8 +42,7 @@ for the synced collections/items, one directory per user named by a hash of the 
 
 # Installation
 
-Python 3.10-3.14 is required. (etebase-py 0.32+ builds against Python's stable ABI via PyO3, so
-Python 3.14 works; older versions of the fork crashed on it.)
+Python 3.10-3.14 is required.
 
 There's currently no installation process, just get the ```ciphwren-cli``` script from this repo,
 create a virtualenv and install the dependencies:
@@ -53,12 +52,12 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt   # or: uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
-Building `etebase` from source requires a Rust toolchain ([rustup](https://rustup.rs/)) and Perl
-modules for the vendored OpenSSL build. On Fedora, if the OpenSSL build fails:
-
-```
-dnf install perl-IPC-Cmd perl-ExtUtils-MakeMaker perl-Time-Piece
-```
+`requirements.txt` takes `ciphwren-etebase` from the wheels of its
+[GitHub release](https://github.com/nikossvnk/etebase-py/releases), which exist for Linux (x86_64,
+aarch64), macOS and Windows. On other platforms pip builds it from source, which needs a Rust toolchain
+([rustup](https://rustup.rs/)) and the Perl modules of the vendored OpenSSL build (on Fedora:
+`dnf install perl-IPC-Cmd perl-ExtUtils-MakeMaker perl-Time-Piece`). Uninstall EteSync's `etebase` from
+an older setup first: both provide the `etebase` module.
 
 The package builds with [maturin](https://www.maturin.rs/) (PEP 517); ```pip``` fetches it
 automatically while building.

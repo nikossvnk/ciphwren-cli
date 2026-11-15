@@ -1,2 +1,4 @@
-etebase @ git+https://github.com/nikossvnk/etebase-py@v0.32.0
+# Our etebase-py fork, imported as etebase. It isn't on PyPI: pip takes the wheel from its GitHub release.
+--find-links https://github.com/nikossvnk/etebase-py/releases/expanded_assets/v0.33.0
+ciphwren-etebase==0.33.0
 vobject==0.9.9
